@@ -1,0 +1,77 @@
+experiment_name: newking_v6_baseline
+
+# ── LoRA hyperparameters ──────────────────────────────────────────────────────
+lora_r: 8
+learning_rate: 5.0e-6
+max_grad_norm: 0.02
+max_steps: 2500
+
+# ── Dataset sample counts ─────────────────────────────────────────────────────
+# All entries are Hippius-hosted seq-packed uint32 .npy shards.
+# Manifest URL = {hippius_base_url}/{dataset_name}/manifest.json
+dataset_counts:
+  dendrite-synth-run: 22000
+  cosmopedia-wikihow-stories-quasar-10b: 13000
+  openthoughts3-1.2m-quasar-10b: 10000
+  finewebedu: 30000
+  automathtext-v2-quasar-10b: 14000
+  nemotron-specialized-v1.2-quasar-10b: 8000
+  openmathreasoning-quasar-10b: 6000
+  ultradata-math-l3-quasar-10b: 5000
+  pes2o-v3: 3000
+  nemotron-cc-math-v1-4plus-mind-quasar-10b: 3000
+
+# ── Dataset sampling multipliers ──────────────────────────────────────────────
+# effective_count = round(base_count * multiplier)
+# Omitted datasets default to 1.0 (no change).
+# Values > 1.0 oversample (with replacement when effective > available).
+# Values < 1.0 undersample.
+dataset_sampling_multipliers: {}  # v6 baseline: no multipliers applied
+
+# ── Dataset loss multipliers ──────────────────────────────────────────────────
+# Applied per example: loss = (per_example_loss * weight).mean()
+# Omitted datasets default to 1.0 (equal weighting).
+dataset_loss_multipliers: {}  # v6 baseline: no loss multipliers applied
+
+# ── Per-dataset manifest URL overrides ───────────────────────────────────────
+# Overrides the default {hippius_base_url}/{name}/manifest.json for individual
+# datasets.  Use when a dataset lives at a non-standard Hippius path.
+# Alternatively, place the pre-downloaded .npy in {dataset_cache_dir}/{name}/
+# and the trainer will use it automatically (no URL needed).
+dataset_manifest_urls: {}
+
+# ── Shard selection ───────────────────────────────────────────────────────────
+# default_shard_index: which shard to download (-1 = last/newest, 0 = first).
+# dataset_shard_indices: per-dataset overrides.
+default_shard_index: -1
+dataset_shard_indices: {}
+
+# ── Dataset groups ────────────────────────────────────────────────────────────
+# Groups are informational and available to future sampling/loss multiplier
+# logic.  No training behaviour is hardcoded to specific dataset names.
+dataset_groups:
+  # Retain broad coverage of general/scientific language.
+  hard_preserve:
+    - finewebedu
+    - pes2o-v3
+
+  # Maintain strong math/reasoning coverage from general sources.
+  general_preserve:
+    - automathtext-v2-quasar-10b
+    - cosmopedia-wikihow-stories-quasar-10b
+    - openthoughts3-1.2m-quasar-10b
+    - ultradata-math-l3-quasar-10b
+    - nemotron-cc-math-v1-4plus-mind-quasar-10b
+
+  # Primary improvement targets for NewKing miner performance.
+  target_improve:
+    - dendrite-synth-run
+    - nemotron-specialized-v1.2-quasar-10b
+    - openmathreasoning-quasar-10b
+
+# ── Hippius dataset source ────────────────────────────────────────────────────
+hippius_base_url: "https://us-east-1.hippius.com/tokens-here/dataset"
+
+# ── Local shard cache root ────────────────────────────────────────────────────
+# Each dataset is cached in its own subdirectory: {dataset_cache_dir}/{name}/
+dataset_cache_dir: "/workspace/teutonic/data"

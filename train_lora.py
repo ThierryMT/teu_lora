@@ -15,7 +15,9 @@ import inspect
 import json
 import os
 import types
+import urllib.error
 import urllib.request
+import yaml
 from pathlib import Path
 
 # Reduce CUDA allocator fragmentation before torch initializes CUDA context.
@@ -50,24 +52,115 @@ from datasets import load_dataset, Dataset
 MODEL_DIR = os.environ.get("TEUTONIC_MODEL_DIR", "/root/teutonic/newking")
 TOKENIZER_ID = os.environ.get("TEUTONIC_TOKENIZER_ID", "silx-ai/Quasar-10B")
 
-# Mix sizes
-MATH_N = int(os.environ.get("TEUTONIC_LORA_MATH_N", "5000"))
-SCIENCE_N = int(os.environ.get("TEUTONIC_LORA_SCIENCE_N", "5000"))
-SYNTH_N = int(os.environ.get("TEUTONIC_LORA_SYNTH_N", "20000"))
-SEQ_LEN = int(os.environ.get("TEUTONIC_LORA_SEQ_LEN", "2048"))
-BATCH_SIZE = int(os.environ.get("TEUTONIC_LORA_BATCH", "1"))
-GRAD_ACCUM = int(os.environ.get("TEUTONIC_LORA_GRAD_ACCUM", "16"))
+# ── YAML config (optional) ────────────────────────────────────────────────────
+# Set TEUTONIC_TRAIN_CONFIG=/path/to/configs/v6_baseline.yaml to load a run
+# config.  Values in the YAML file take precedence over env vars.  If no config
+# is provided the legacy 3-dataset env-var path is used unchanged.
+_cfg: dict = {}
+_cfg_path = os.environ.get("TEUTONIC_TRAIN_CONFIG", "")
+if _cfg_path:
+    with open(_cfg_path) as _f:
+        _cfg = yaml.safe_load(_f) or {}
+    print(f"[config] loaded: {_cfg_path}  (experiment: {_cfg.get('experiment_name', '?')})")
 
-SYNTH_MANIFEST_URL = os.environ.get(
-    "TEUTONIC_SYNTH_MANIFEST_URL",
-    "https://us-east-1.hippius.com/tokens-here/dataset/quasar-synth-v1/manifest.json",
-)
-SYNTH_CACHE_DIR = Path(
-    os.environ.get(
-        "TEUTONIC_SYNTH_CACHE_DIR",
-        "/workspace/teutonic/data/quasar-synth-v1",
+def _cv(yaml_key: str, env_var: str, default):
+    """Config value: YAML key → env var → default (type-cast to default's type)."""
+    if yaml_key in _cfg:
+        return type(default)(_cfg[yaml_key])
+    val = os.environ.get(env_var)
+    return type(default)(val) if val is not None else default
+
+EXPERIMENT_NAME: str = _cfg.get("experiment_name", "lora-run")
+
+# LoRA hyperparameters
+LORA_R         = _cv("lora_r",        "TEUTONIC_LORA_R",            16)
+LEARNING_RATE  = _cv("learning_rate", "TEUTONIC_LORA_LR",           2e-4)
+MAX_GRAD_NORM  = _cv("max_grad_norm", "TEUTONIC_LORA_MAX_GRAD_NORM", 1.0)
+MAX_STEPS      = _cv("max_steps",     "TEUTONIC_LORA_MAX_STEPS",    -1)   # -1 = use num_train_epochs
+
+# Sequence / batch parameters
+SEQ_LEN    = _cv("seq_len",    "TEUTONIC_LORA_SEQ_LEN",    2048)
+BATCH_SIZE = _cv("batch_size", "TEUTONIC_LORA_BATCH",       1)
+GRAD_ACCUM = _cv("grad_accum", "TEUTONIC_LORA_GRAD_ACCUM", 16)
+
+# ── Dataset config ────────────────────────────────────────────────────────────
+# Config-driven path: dataset_counts maps dataset name → number of sequences.
+# Legacy path (no YAML): three env vars as before.
+DATASET_COUNTS: dict[str, int]
+DATASET_GROUPS: dict[str, list[str]]
+HIPPIUS_BASE_URL: str
+DATASET_CACHE_DIR: Path
+
+if _cfg:
+    DATASET_COUNTS = {k: int(v) for k, v in _cfg.get("dataset_counts", {}).items()}
+    DATASET_GROUPS = {
+        grp: list(names)
+        for grp, names in _cfg.get("dataset_groups", {}).items()
+    }
+    HIPPIUS_BASE_URL = str(
+        _cfg.get("hippius_base_url",
+                 "https://us-east-1.hippius.com/tokens-here/dataset")
     )
-)
+    DATASET_CACHE_DIR = Path(
+        _cfg.get("dataset_cache_dir",
+                 os.environ.get("TEUTONIC_SYNTH_CACHE_DIR", "/workspace/teutonic/data"))
+    )
+else:
+    # Legacy 3-dataset mode — kept for backward compatibility.
+    _MATH_N    = int(os.environ.get("TEUTONIC_LORA_MATH_N",    "5000"))
+    _SCIENCE_N = int(os.environ.get("TEUTONIC_LORA_SCIENCE_N", "5000"))
+    _SYNTH_N   = int(os.environ.get("TEUTONIC_LORA_SYNTH_N",   "20000"))
+    DATASET_COUNTS = {
+        "openmathreasoning": _MATH_N,
+        "pes2o":             _SCIENCE_N,
+        "quasar-synth-v1":  _SYNTH_N,
+    }
+    DATASET_GROUPS = {}
+    HIPPIUS_BASE_URL = "https://us-east-1.hippius.com/tokens-here/dataset"
+    DATASET_CACHE_DIR = Path(
+        os.environ.get("TEUTONIC_SYNTH_CACHE_DIR",
+                       "/workspace/teutonic/data/quasar-synth-v1")
+    )
+    # Legacy manifest URL (used only in the legacy dataset-loading branch below).
+    _LEGACY_SYNTH_MANIFEST_URL = os.environ.get(
+        "TEUTONIC_SYNTH_MANIFEST_URL",
+        "https://us-east-1.hippius.com/tokens-here/dataset/quasar-synth-v1/manifest.json",
+    )
+
+# Per-dataset sampling multipliers (name → float, default 1.0).
+# Applied as:  effective_count = round(base_count * multiplier)
+# If effective_count > available sequences, sampling is done with replacement.
+# Empty dict → no-op (identical to all multipliers = 1.0).
+DATASET_SAMPLING_MULTIPLIERS: dict[str, float] = {
+    k: float(v)
+    for k, v in _cfg.get("dataset_sampling_multipliers", {}).items()
+}
+
+# Per-dataset loss multipliers (name → float, default 1.0).
+# Applied as:  loss = (per_example_loss * weight).mean()
+# Empty dict → no-op; all samples weighted equally.
+DATASET_LOSS_MULTIPLIERS: dict[str, float] = {
+    k: float(v)
+    for k, v in _cfg.get("dataset_loss_multipliers", {}).items()
+}
+
+# Per-dataset manifest URL overrides (name → full manifest URL).
+# When set, overrides the default {hippius_base_url}/{name}/manifest.json.
+# Use this when a dataset lives under a non-standard Hippius path.
+DATASET_MANIFEST_URLS: dict[str, str] = {
+    k: str(v)
+    for k, v in _cfg.get("dataset_manifest_urls", {}).items()
+}
+
+# Per-dataset shard index to download (name → int, default -1 = last shard).
+# -1  : always use the newest/last shard in the manifest  ← default
+#  0  : first shard (oldest)
+#  N  : Nth shard (0-based, negative indices wrap from the end)
+DATASET_SHARD_INDICES: dict[str, int] = {
+    k: int(v)
+    for k, v in _cfg.get("dataset_shard_indices", {}).items()
+}
+_DEFAULT_SHARD_INDEX: int = int(_cfg.get("default_shard_index", -1))
 
 def patch_transformers_masking_compat() -> None:
     """Quasar modeling passes cache_position; some masking_utils builds reject it."""
@@ -184,6 +277,7 @@ patch_transformers_masking_compat()
 # 0. ENVIRONMENT CHECK
 # ─────────────────────────────────────────────
 print("=" * 55)
+print(f"  Experiment   : {EXPERIMENT_NAME}")
 print(f"  PyTorch      : {torch.__version__}")
 print(f"  Transformers : {transformers.__version__}")
 print(f"  PEFT         : {peft_lib.__version__}")
@@ -191,9 +285,20 @@ print(f"  CUDA         : {torch.version.cuda}")
 print(f"  GPU          : {torch.cuda.get_device_name(0)}")
 print(f"  VRAM         : {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
 print(f"  BF16         : {torch.cuda.is_bf16_supported()}")
+print(f"  LoRA R       : {LORA_R}")
+print(f"  LR           : {LEARNING_RATE}")
+print(f"  Max grad norm: {MAX_GRAD_NORM}")
+print(f"  Max steps    : {MAX_STEPS if MAX_STEPS > 0 else '(full epoch)'}")
 print(f"  Batch/Accum  : {BATCH_SIZE} / {GRAD_ACCUM}  (effective {BATCH_SIZE * GRAD_ACCUM})")
 print(f"  Seq length   : {SEQ_LEN}")
-print(f"  Mix          : math={MATH_N:,}  science={SCIENCE_N:,}  synth={SYNTH_N:,}")
+print(f"  Datasets     : {list(DATASET_COUNTS.keys())}")
+total_seqs = sum(DATASET_COUNTS.values())
+print(f"  Total seqs   : {total_seqs:,}")
+if DATASET_GROUPS:
+    for grp, members in DATASET_GROUPS.items():
+        print(f"  Group [{grp}]: {members}")
+if DATASET_SAMPLING_MULTIPLIERS:
+    print(f"  Sampling ×    : {DATASET_SAMPLING_MULTIPLIERS}")
 print("=" * 55)
 
 assert torch.cuda.is_available(), "❌ CUDA not available!"
@@ -222,6 +327,15 @@ def format_science(example):
     return {"text": example["text"]}
 
 
+def tokenize_fn(example):
+    return tokenizer(
+        example["text"],
+        truncation=True,
+        max_length=SEQ_LEN,
+        padding=False,
+    )
+
+
 class CausalLmTorchDataset(TorchDataset):
     """Wrap token-id rows for Trainer (provides input_ids / attention_mask / labels)."""
 
@@ -243,10 +357,11 @@ class CausalLmTorchDataset(TorchDataset):
 class MmapPackedSynthDataset(TorchDataset):
     """Random-access view over a seq-packed uint32 .npy shard (shape [n_tokens])."""
 
-    def __init__(self, path: Path, seq_indices: np.ndarray, seq_len: int):
+    def __init__(self, path: Path, seq_indices: np.ndarray, seq_len: int, dataset_id: int = 0):
         self.mmap = np.load(path, mmap_mode="r")
         self.seq_indices = np.asarray(seq_indices, dtype=np.int64)
         self.seq_len = int(seq_len)
+        self.dataset_id = int(dataset_id)
 
     def __len__(self) -> int:
         return int(self.seq_indices.shape[0])
@@ -260,6 +375,7 @@ class MmapPackedSynthDataset(TorchDataset):
             "input_ids": ids,
             "attention_mask": torch.ones_like(ids),
             "labels": ids.clone(),
+            "dataset_id": torch.tensor(self.dataset_id, dtype=torch.long),
         }
 
 
@@ -273,14 +389,18 @@ def synth_shard_url(manifest_url: str, shard_key: str) -> str:
     return f"{base}/shards/{fname}"
 
 
-def ensure_synth_shard(manifest_url: str, cache_dir: Path) -> tuple[Path, dict]:
+def ensure_synth_shard(
+    manifest_url: str,
+    cache_dir: Path,
+    shard_index: int = -1,
+) -> tuple[Path, dict]:
     cache_dir.mkdir(parents=True, exist_ok=True)
     with urllib.request.urlopen(manifest_url, timeout=60) as resp:
         manifest = json.loads(resp.read().decode("utf-8"))
     shards = manifest.get("shards") or []
     if not shards:
         raise RuntimeError(f"no shards in manifest: {manifest_url}")
-    shard = shards[0]
+    shard = shards[shard_index]
     key = shard["key"]
     url = synth_shard_url(manifest_url, key)
     expected = int(shard.get("size_bytes") or 0)
@@ -288,7 +408,8 @@ def ensure_synth_shard(manifest_url: str, cache_dir: Path) -> tuple[Path, dict]:
     if dest.exists() and (expected <= 0 or dest.stat().st_size == expected):
         print(f"      Synth shard cached: {dest} ({dest.stat().st_size:,} bytes)")
         return dest, manifest
-    print(f"      Downloading synth shard:\n        {url}")
+    idx_label = f"[{shard_index}]" if shard_index != -1 else "[last]"
+    print(f"      Downloading shard {idx_label} of {len(shards)}:\n        {url}")
     tmp = dest.with_suffix(dest.suffix + ".partial")
     urllib.request.urlretrieve(url, tmp)
     if expected > 0 and tmp.stat().st_size != expected:
@@ -300,7 +421,57 @@ def ensure_synth_shard(manifest_url: str, cache_dir: Path) -> tuple[Path, dict]:
     return dest, manifest
 
 
-# ─────────────────────────────────────────────
+def _load_or_download_shard(
+    ds_name: str,
+    manifest_url: str,
+    cache_dir: Path,
+    seq_len: int,
+    shard_index: int = -1,
+) -> tuple[Path, dict]:
+    """Return (shard_path, manifest).
+
+    Resolution order:
+      1. Any *.npy already in cache_dir  — use it; read manifest.json if
+         present beside it, else synthesise a minimal one from seq_len.
+      2. Network download via manifest_url / ensure_synth_shard.
+         shard_index selects which shard to download (-1 = last/newest).
+         On HTTP 404, raises a RuntimeError with actionable instructions.
+    """
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── Local-first: skip network if a shard is already on disk ──────────────
+    npy_files = sorted(cache_dir.glob("*.npy"))
+    if npy_files:
+        npy = npy_files[0]
+        local_mf = cache_dir / "manifest.json"
+        if local_mf.exists():
+            manifest: dict = json.loads(local_mf.read_text())
+        else:
+            manifest = {
+                "seq_len": seq_len,
+                "shards": [{"key": npy.name, "size_bytes": npy.stat().st_size}],
+            }
+        print(f"      [{ds_name}] local shard: {npy.name}  ({npy.stat().st_size:,} bytes)")
+        return npy, manifest
+
+    # ── Network download ──────────────────────────────────────────────────────
+    try:
+        return ensure_synth_shard(manifest_url, cache_dir, shard_index=shard_index)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            raise RuntimeError(
+                f"\n\n  ✗  [{ds_name}] Manifest not found — HTTP 404\n"
+                f"     URL tried : {manifest_url}\n\n"
+                f"  Fix options (choose one):\n\n"
+                f"  A) Override the manifest URL in your config:\n"
+                f"       dataset_manifest_urls:\n"
+                f"         {ds_name}: <correct_hippius_manifest_url>\n\n"
+                f"  B) Pre-download the .npy shard and place it here:\n"
+                f"       {cache_dir}/\n"
+                f"     The trainer will detect it automatically on next start.\n"
+                f"     (Use hippius-hub or direct S3 download to obtain the shard.)\n"
+            ) from exc
+        raise# ─────────────────────────────────────────────
 # 1. TOKENIZER
 # ─────────────────────────────────────────────
 print(f"\n[1/8] Loading tokenizer from {TOKENIZER_ID} ...")
@@ -337,8 +508,8 @@ print(f"      VRAM free  : {80.0 - vram_used:.2f} GB")
 print("\n[3/8] Injecting LoRA adapters...")
 lora_config = LoraConfig(
     task_type=TaskType.CAUSAL_LM,
-    r=16,
-    lora_alpha=32,
+    r=LORA_R,
+    lora_alpha=LORA_R * 2,
     lora_dropout=0.05,
     bias="none",
     target_modules=[
@@ -403,69 +574,132 @@ print(f"      Micro check OK  loss={float(loss):.4f}  "
 # 5. DATASETS — mixed corpus
 # ─────────────────────────────────────────────
 print("\n[5/8] Building mixed training set...")
-print(f"      target mix: math={MATH_N:,}  science={SCIENCE_N:,}  synth={SYNTH_N:,}")
+print(f"      target mix: {DATASET_COUNTS}")
 
+per_ds_datasets: list[TorchDataset] = []
 
-def tokenize_fn(example):
-    return tokenizer(
-        example["text"],
-        truncation=True,
-        max_length=SEQ_LEN,
-        padding=False,
+if _cfg:
+    # ── Config-driven path ────────────────────────────────────────────────────
+    # All datasets are Hippius-hosted seq-packed uint32 .npy shards.
+    # Manifest URL: {HIPPIUS_BASE_URL}/{dataset_name}/manifest.json
+    _sampling_plan: list[tuple[str, int, float, int]] = []  # (name, base, mult, effective)
+
+    for ds_idx, (ds_name, ds_count) in enumerate(DATASET_COUNTS.items()):
+        manifest_url = DATASET_MANIFEST_URLS.get(
+            ds_name, f"{HIPPIUS_BASE_URL}/{ds_name}/manifest.json"
+        )
+        cache_dir = DATASET_CACHE_DIR / ds_name
+        print(f"      [{ds_name}] base={ds_count:,}  manifest: {manifest_url}")
+        shard_path, shard_manifest = _load_or_download_shard(
+            ds_name, manifest_url, cache_dir, SEQ_LEN,
+            shard_index=DATASET_SHARD_INDICES.get(ds_name, _DEFAULT_SHARD_INDEX),
+        )
+        manifest_seq_len = int(shard_manifest.get("seq_len") or SEQ_LEN)
+        if manifest_seq_len != SEQ_LEN:
+            raise RuntimeError(
+                f"{ds_name}: manifest seq_len={manifest_seq_len} != SEQ_LEN={SEQ_LEN}"
+            )
+        ds_mmap = np.load(shard_path, mmap_mode="r")
+        n_seqs_avail = int(ds_mmap.shape[0]) // SEQ_LEN
+        if n_seqs_avail == 0:
+            raise RuntimeError(
+                f"{ds_name}: shard has no complete sequences at seq_len={SEQ_LEN}"
+            )
+
+        # Apply sampling multiplier.
+        multiplier = DATASET_SAMPLING_MULTIPLIERS.get(ds_name, 1.0)
+        effective_count = max(1, round(ds_count * multiplier))
+        # Oversample with replacement when effective_count exceeds available sequences.
+        replace = effective_count > n_seqs_avail
+        if not replace and n_seqs_avail < ds_count:
+            raise RuntimeError(
+                f"{ds_name}: only {n_seqs_avail:,} seqs available, need {ds_count:,}"
+            )
+
+        indices = np.random.default_rng(42).choice(n_seqs_avail, size=effective_count, replace=replace)
+        per_ds_datasets.append(MmapPackedSynthDataset(shard_path, indices, SEQ_LEN, dataset_id=ds_idx))
+        _sampling_plan.append((ds_name, ds_count, multiplier, effective_count))
+
+        tag = f" (×{multiplier} → {effective_count:,})" if multiplier != 1.0 else ""
+        resample_tag = " [oversample]" if replace else ""
+        si = DATASET_SHARD_INDICES.get(ds_name, _DEFAULT_SHARD_INDEX)
+        si_tag = f"  shard={'last' if si == -1 else si}"
+        print(f"      {ds_name}: {ds_count:,}{tag}  avail={n_seqs_avail:,}{resample_tag}{si_tag} ✅")
+
+    # ── Effective sampling plan summary ──────────────────────────────────────
+    _eff_total = sum(e for _, _, _, e in _sampling_plan)
+    col = max(len(n) for n, *_ in _sampling_plan)
+    print(f"\n      {'─' * (col + 42)}")
+    print(f"      {'Dataset':<{col}}  {'base':>8}  {'×mult':>6}  {'effective':>10}  {'%':>6}")
+    print(f"      {'─' * (col + 42)}")
+    for ds_name, base, mult, eff in _sampling_plan:
+        pct = 100.0 * eff / _eff_total
+        mult_str = f"×{mult:.2f}"
+        print(f"      {ds_name:<{col}}  {base:>8,}  {mult_str:>6}  {eff:>10,}  {pct:>5.1f}%")
+    print(f"      {'─' * (col + 42)}")
+    print(f"      {'TOTAL':<{col}}  {'':>8}  {'':>6}  {_eff_total:>10,}  {'100.0%':>6}")
+    print(f"      {'─' * (col + 42)}\n")
+
+else:
+    # ── Legacy 3-dataset path (no YAML config) ────────────────────────────────
+    print(f"      [legacy] math={_MATH_N:,}  science={_SCIENCE_N:,}  synth={_SYNTH_N:,}")
+
+    print(f"      Streaming nvidia/OpenMathReasoning cot ({_MATH_N:,})...")
+    ds_math_stream = load_dataset(
+        "nvidia/OpenMathReasoning",
+        split="cot",
+        streaming=True,
+    )
+    ds_math_stream = ds_math_stream.shuffle(seed=42, buffer_size=10_000).take(_MATH_N)
+    ds_math = Dataset.from_list([format_math(x) for x in ds_math_stream])
+    ds_math = ds_math.map(tokenize_fn, batched=True, remove_columns=["text"])
+    math_rows = [list(x) for x in ds_math["input_ids"]]
+    print(f"      Math done    : {len(math_rows):,} samples ✅")
+
+    print(f"      Streaming allenai/peS2o json shards ({_SCIENCE_N:,})...")
+    ds_sci_stream = load_dataset(
+        "json",
+        data_files="hf://datasets/allenai/peS2o/data/v2/train-*.json.gz",
+        split="train",
+        streaming=True,
+    )
+    ds_sci_stream = ds_sci_stream.shuffle(seed=42, buffer_size=10_000).take(_SCIENCE_N)
+    ds_science = Dataset.from_list([format_science(x) for x in ds_sci_stream])
+    ds_science = ds_science.map(tokenize_fn, batched=True, remove_columns=["text"])
+    science_rows = [list(x) for x in ds_science["input_ids"]]
+    print(f"      Science done : {len(science_rows):,} samples ✅")
+
+    print(f"      Loading quasar-synth-v1 packed npy ({_SYNTH_N:,})...")
+    print(f"      manifest: {_LEGACY_SYNTH_MANIFEST_URL}")
+    synth_path, synth_manifest = ensure_synth_shard(_LEGACY_SYNTH_MANIFEST_URL, DATASET_CACHE_DIR)
+    manifest_seq_len = int(synth_manifest.get("seq_len") or SEQ_LEN)
+    if manifest_seq_len != SEQ_LEN:
+        raise RuntimeError(
+            f"synth seq_len={manifest_seq_len} != training SEQ_LEN={SEQ_LEN}"
+        )
+    synth_mmap = np.load(synth_path, mmap_mode="r")
+    n_tokens = int(synth_mmap.shape[0])
+    n_seqs_avail = n_tokens // SEQ_LEN
+    if n_seqs_avail < _SYNTH_N:
+        raise RuntimeError(
+            f"synth only has {n_seqs_avail:,} sequences, need {_SYNTH_N:,}"
+        )
+    rng = np.random.default_rng(42)
+    synth_indices = rng.choice(n_seqs_avail, size=_SYNTH_N, replace=False)
+    synth_ds = MmapPackedSynthDataset(synth_path, synth_indices, SEQ_LEN)
+    print(
+        f"      Synth done   : {len(synth_ds):,} / {n_seqs_avail:,} available "
+        f"({n_tokens:,} tokens) ✅"
     )
 
+    per_ds_datasets = [
+        CausalLmTorchDataset(math_rows),
+        CausalLmTorchDataset(science_rows),
+        synth_ds,
+    ]
 
-print(f"      Streaming nvidia/OpenMathReasoning cot ({MATH_N:,})...")
-ds_math_stream = load_dataset(
-    "nvidia/OpenMathReasoning",
-    split="cot",
-    streaming=True,
-)
-ds_math_stream = ds_math_stream.shuffle(seed=42, buffer_size=10_000).take(MATH_N)
-ds_math = Dataset.from_list([format_math(x) for x in ds_math_stream])
-ds_math = ds_math.map(tokenize_fn, batched=True, remove_columns=["text"])
-math_rows = [list(x) for x in ds_math["input_ids"]]
-print(f"      Math done    : {len(math_rows):,} samples ✅")
 
-print(f"      Streaming allenai/peS2o json shards ({SCIENCE_N:,})...")
-ds_sci_stream = load_dataset(
-    "json",
-    data_files="hf://datasets/allenai/peS2o/data/v2/train-*.json.gz",
-    split="train",
-    streaming=True,
-)
-ds_sci_stream = ds_sci_stream.shuffle(seed=42, buffer_size=10_000).take(SCIENCE_N)
-ds_science = Dataset.from_list([format_science(x) for x in ds_sci_stream])
-ds_science = ds_science.map(tokenize_fn, batched=True, remove_columns=["text"])
-science_rows = [list(x) for x in ds_science["input_ids"]]
-print(f"      Science done : {len(science_rows):,} samples ✅")
-
-print(f"      Loading quasar-synth-v1 packed npy ({SYNTH_N:,})...")
-print(f"      manifest: {SYNTH_MANIFEST_URL}")
-synth_path, synth_manifest = ensure_synth_shard(SYNTH_MANIFEST_URL, SYNTH_CACHE_DIR)
-manifest_seq_len = int(synth_manifest.get("seq_len") or SEQ_LEN)
-if manifest_seq_len != SEQ_LEN:
-    raise RuntimeError(
-        f"synth seq_len={manifest_seq_len} != training SEQ_LEN={SEQ_LEN}"
-    )
-synth_mmap = np.load(synth_path, mmap_mode="r")
-n_tokens = int(synth_mmap.shape[0])
-n_seqs_avail = n_tokens // SEQ_LEN
-if n_seqs_avail < SYNTH_N:
-    raise RuntimeError(
-        f"synth only has {n_seqs_avail:,} sequences, need {SYNTH_N:,}"
-    )
-rng = np.random.default_rng(42)
-synth_indices = rng.choice(n_seqs_avail, size=SYNTH_N, replace=False)
-synth_ds = MmapPackedSynthDataset(synth_path, synth_indices, SEQ_LEN)
-print(
-    f"      Synth done   : {len(synth_ds):,} / {n_seqs_avail:,} available "
-    f"({n_tokens:,} tokens) ✅"
-)
-
-math_ds = CausalLmTorchDataset(math_rows)
-science_ds = CausalLmTorchDataset(science_rows)
-combined = ConcatDataset([math_ds, science_ds, synth_ds])
+combined = ConcatDataset(per_ds_datasets)
 
 
 class ShuffledDataset(TorchDataset):
@@ -493,11 +727,12 @@ steps_per_epoch = max(1, len(train_dataset) // max(1, BATCH_SIZE * GRAD_ACCUM))
 warmup_steps = max(1, int(0.03 * steps_per_epoch))
 
 training_args = TrainingArguments(
-    output_dir="./lora-smoke-test-output",
+    output_dir=f"./{EXPERIMENT_NAME}-output",
     per_device_train_batch_size=BATCH_SIZE,
     gradient_accumulation_steps=GRAD_ACCUM,
     num_train_epochs=1,
-    learning_rate=2e-4,
+    max_steps=MAX_STEPS if MAX_STEPS > 0 else -1,
+    learning_rate=LEARNING_RATE,
     lr_scheduler_type="cosine",
     warmup_steps=warmup_steps,
     bf16=True,
@@ -512,19 +747,86 @@ training_args = TrainingArguments(
     remove_unused_columns=False,
     dataloader_num_workers=2,
     dataloader_pin_memory=True,
-    max_grad_norm=1.0,
+    max_grad_norm=MAX_GRAD_NORM,
 )
 
 # ─────────────────────────────────────────────
 # 7. TRAINER
 # ─────────────────────────────────────────────
+
+# ── Loss weight tensor (one float per dataset_id index) ──────────────────────
+# Index i = position of dataset in DATASET_COUNTS; value = loss multiplier.
+# Shape [num_datasets], float32.  Moved to GPU lazily inside compute_loss.
+_ds_names_ordered = list(DATASET_COUNTS.keys())
+_id_to_loss_weight = torch.ones(len(_ds_names_ordered))
+for _i, _name in enumerate(_ds_names_ordered):
+    _id_to_loss_weight[_i] = DATASET_LOSS_MULTIPLIERS.get(_name, 1.0)
+
+if DATASET_LOSS_MULTIPLIERS:
+    print("\n  Active dataset loss multipliers:")
+    col = max(len(n) for n in _ds_names_ordered)
+    for _name, _w in DATASET_LOSS_MULTIPLIERS.items():
+        print(f"    {_name:<{col}} : ×{_w}")
+    # Warn on any configured name not present in the active dataset mix.
+    for _name in DATASET_LOSS_MULTIPLIERS:
+        if _name not in DATASET_COUNTS:
+            print(
+                f"  ⚠️  Warning: loss multiplier configured for '{_name}' "
+                "but it is not in dataset_counts — multiplier has no effect."
+            )
+
+_use_weighted_loss = bool(DATASET_LOSS_MULTIPLIERS) and _cfg
+
+
+class WeightedLossTrainer(Trainer):
+    """Trainer subclass that applies per-dataset loss multipliers.
+
+    Set ``loss_weights`` to a 1-D float tensor of shape [num_datasets] before
+    training.  Index i must correspond to the integer ``dataset_id`` stored in
+    each batch.  When ``loss_weights`` is None every sample is weighted equally
+    and the behaviour is identical to the base Trainer.
+    """
+
+    loss_weights: torch.Tensor | None = None
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        dataset_ids = inputs.pop("dataset_id", None)
+        outputs = model(**inputs)
+
+        # Fast path: no per-dataset weights configured, or metadata not present.
+        if self.loss_weights is None or dataset_ids is None:
+            loss = outputs.loss
+            return (loss, outputs) if return_outputs else loss
+
+        weights = self.loss_weights.to(dataset_ids.device)[dataset_ids]  # [B]
+
+        # Skip the expensive per-example path when all weights in this batch are 1.
+        if weights.eq(1.0).all():
+            loss = outputs.loss
+            return (loss, outputs) if return_outputs else loss
+
+        # Per-example cross-entropy (sequences are fully packed; no -100 labels).
+        logits = outputs.logits                 # [B, T, V]
+        labels = inputs["labels"]               # [B, T]
+        B, T = labels.shape
+        loss_fct = torch.nn.CrossEntropyLoss(reduction="none")
+        per_token = loss_fct(
+            logits[:, :-1].reshape(-1, logits.size(-1)),
+            labels[:, 1:].reshape(-1),
+        )                                        # [B * (T-1)]
+        per_sample = per_token.view(B, T - 1).mean(dim=-1)  # [B]
+        loss = (per_sample * weights).mean()
+        return (loss, outputs) if return_outputs else loss
+
+
 print("\n[7/8] Building Trainer...")
-trainer = Trainer(
+trainer = WeightedLossTrainer(
     model=model,
     args=training_args,
     train_dataset=train_dataset,
     data_collator=default_data_collator,
 )
+trainer.loss_weights = _id_to_loss_weight if _use_weighted_loss else None
 
 # ─────────────────────────────────────────────
 # 8. TRAIN
@@ -553,10 +855,10 @@ print("=" * 55)
 # ─────────────────────────────────────────────
 # SAVE ADAPTER ONLY
 # ─────────────────────────────────────────────
-model.save_pretrained("./lora-smoke-test-adapter")
-tokenizer.save_pretrained("./lora-smoke-test-adapter")
+model.save_pretrained(f"./{EXPERIMENT_NAME}-adapter")
+tokenizer.save_pretrained(f"./{EXPERIMENT_NAME}-adapter")
 
 peak_vram = torch.cuda.max_memory_allocated(0) / 1e9
 print(f"\n  Peak VRAM usage : {peak_vram:.2f} GB / 80.0 GB")
-print("  Adapter saved   : ./lora-smoke-test-adapter/")
+print(f"  Adapter saved   : ./{EXPERIMENT_NAME}-adapter/")
 print(f"  Original model  : {MODEL_DIR}  ← untouched ✅")

@@ -1,4 +1,4 @@
-// PM2 entry for LoRA smoke-test training (train_lora.py).
+// PM2 entry for LoRA training (train_lora.py).
 //
 // One-shot job: runs once, exits when training finishes. Does not autorestart.
 //
@@ -10,8 +10,8 @@ module.exports = {
   apps: [{
     name: "teutonic-train-lora",
     script: "train_lora.py",
-    interpreter: "/workspace/teutonic/.venv/bin/python",
-    cwd: "/workspace/teutonic",
+    interpreter: "/workspace/teu_lora/.venv/bin/python",
+    cwd: "/workspace/teu_lora",
     exec_mode: "fork",
     instances: 1,
     autorestart: false,
@@ -21,16 +21,14 @@ module.exports = {
     env: {
       PYTHONUNBUFFERED: "1",
       HF_HOME: "/workspace/.hf_home",
-      PYTHONPATH: "/workspace/teutonic/newking",
+      PYTHONPATH: "/workspace/teu_lora/newking",
       PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True",
       TOKENIZERS_PARALLELISM: "false",
+      // Active run config — swap to a different config file to change experiments.
+      TEUTONIC_TRAIN_CONFIG: "/workspace/teu_lora/configs/v7_hard_preserve.yaml",
       TEUTONIC_LORA_BATCH: "1",
       TEUTONIC_LORA_GRAD_ACCUM: "16",
       TEUTONIC_LORA_SEQ_LEN: "2048",
-      TEUTONIC_LORA_MATH_N: "5000",
-      TEUTONIC_LORA_SCIENCE_N: "5000",
-      TEUTONIC_LORA_SYNTH_N: "20000",
-      TEUTONIC_SYNTH_MANIFEST_URL: "https://us-east-1.hippius.com/tokens-here/dataset/quasar-synth-v1/manifest.json",
     },
   }],
 };

@@ -1,0 +1,66 @@
+experiment_name: newking_v7
+
+# ── LoRA hyperparameters (unchanged from v6) ─────────────────────────────────
+lora_r: 8
+learning_rate: 5.0e-6
+max_grad_norm: 0.02
+max_steps: 2500
+
+# ── Dataset sample counts (unchanged from v6) ────────────────────────────────
+dataset_counts:
+  dendrite-synth-run: 22000
+  cosmopedia-wikihow-stories-quasar-10b: 13000
+  openthoughts3-1.2m-quasar-10b: 10000
+  finewebedu: 30000
+  automathtext-v2-quasar-10b: 14000
+  nemotron-specialized-v1.2-quasar-10b: 8000
+  openmathreasoning-quasar-10b: 6000
+  ultradata-math-l3-quasar-10b: 5000
+  pes2o-v3: 3000
+  nemotron-cc-math-v1-4plus-mind-quasar-10b: 3000
+
+# ── Dataset sampling multipliers ─────────────────────────────────────────────
+# v6 showed negative drift on hard-preserve datasets:
+#   finewebedu: Δ = -0.00021
+#   pes2o-v3:   Δ = -0.00024
+#
+# Increase effective sampling pressure on both.
+#   finewebedu : 30000 × 1.2 → 36,000 effective sequences
+#   pes2o-v3   :  3000 × 2.0 →  6,000 effective sequences (oversampled with replacement)
+#
+# All other datasets keep multiplier = 1.0 (default, no entry needed).
+dataset_sampling_multipliers:
+  finewebedu: 1.2
+  pes2o-v3: 2.0
+
+# ── Dataset loss multipliers ──────────────────────────────────────────────────
+# Amplify the gradient signal from hard-preserve datasets that drifted in v6.
+# Applied per example: loss = (per_example_loss * weight).mean()
+# All other datasets default to ×1.0.
+dataset_loss_multipliers:
+  finewebedu: 1.2
+  pes2o-v3: 1.5
+
+# ── Dataset groups ────────────────────────────────────────────────────────────
+dataset_groups:
+  hard_preserve:
+    - finewebedu
+    - pes2o-v3
+
+  general_preserve:
+    - automathtext-v2-quasar-10b
+    - cosmopedia-wikihow-stories-quasar-10b
+    - openthoughts3-1.2m-quasar-10b
+    - ultradata-math-l3-quasar-10b
+    - nemotron-cc-math-v1-4plus-mind-quasar-10b
+
+  target_improve:
+    - dendrite-synth-run
+    - nemotron-specialized-v1.2-quasar-10b
+    - openmathreasoning-quasar-10b
+
+# ── Hippius dataset source ────────────────────────────────────────────────────
+hippius_base_url: "https://us-east-1.hippius.com/tokens-here/dataset"
+
+# ── Local shard cache root ────────────────────────────────────────────────────
+dataset_cache_dir: "/workspace/teutonic/data"

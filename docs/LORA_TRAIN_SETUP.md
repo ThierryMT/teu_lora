@@ -117,6 +117,31 @@ Keep these in mind if you rewrite `train_lora.py` or upgrade packages.
 | 7 | `CUDA error: illegal memory access` in `fla` GLA backward | Triton 3.7 autotune incompatible | **Pin `triton==3.3.0`**; script aborts if ≥3.4 |
 | 8 | Safetensors `header too large` | Encrypted king shards | Decrypt with `age` before `from_pretrained` |
 | 9 | Synth manifest `shard_prefix` points at `quasar-synth-run` (404) | Stale prefix in manifest | Resolve shard next to manifest: `…/quasar-synth-v1/shards/<file>` |
+| 10 | `urllib.error.HTTPError: HTTP Error 404: Not Found` on dataset manifest | Default manifest URL pattern (`tokens-here/dataset/{name}/manifest.json`) doesn't match all Hippius dataset paths | Two fixes — see below |
+
+**Bug 10 detail — manifest 404 for Hippius datasets**
+
+Triggered when adding new datasets to `dataset_counts` whose manifests aren't at the standard URL path.
+
+Fix A — override the URL per-dataset in your config:
+
+```yaml
+dataset_manifest_urls:
+  dendrite-synth-run: https://us-east-1.hippius.com/<correct-bucket>/dendrite-synth-run/manifest.json
+```
+
+Fix B — pre-download the `.npy` shard manually and place it in the cache directory:
+
+```bash
+# The trainer auto-detects any *.npy already in the expected cache path.
+# No manifest URL is needed when the file is already present.
+CACHE=/workspace/teutonic/data/<dataset-name>
+mkdir -p $CACHE
+# copy / download the .npy here, e.g. via hippius-hub or direct S3:
+hippius-hub download <namespace>/<dataset-name> shard_000000.npy --local-dir $CACHE
+```
+
+Once the `.npy` is in place restart training — `_load_or_download_shard()` in `train_lora.py` checks the local directory first and skips the network entirely.
 
 Modeling patch location (commit/keep in sync with HF dynamic-module cache):
 

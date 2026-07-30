@@ -1,0 +1,106 @@
+experiment_name: newking_v7_hard_preserve
+
+# ── LoRA hyperparameters ──────────────────────────────────────────────────────
+# Identical to v6 baseline. Do not modify unless starting a new hyperparameter
+# sweep — keep v6 as the reference point.
+lora_r: 8
+learning_rate: 5.0e-6
+max_grad_norm: 0.02
+max_steps: 2500
+
+# ── Dataset sample counts ─────────────────────────────────────────────────────
+# Base counts unchanged from v6. Effective sampling is controlled by
+# dataset_sampling_multipliers below.
+dataset_counts:
+  dendrite-synth-run: 22000
+  cosmopedia-wikihow-stories-quasar-10b: 13000
+  openthoughts3-1.2m-quasar-10b: 10000
+  finewebedu: 30000
+  automathtext-v2-quasar-10b: 14000
+  nemotron-specialized-v1.2-quasar-10b: 8000
+  openmathreasoning-quasar-10b: 6000
+  ultradata-math-l3-quasar-10b: 5000
+  pes2o-v3: 3000
+  nemotron-cc-math-v1-4plus-mind-quasar-10b: 3000
+
+# ── Dataset groups ────────────────────────────────────────────────────────────
+# Groups are informational and available to future sampling/loss logic.
+# No training behaviour is hardcoded to specific dataset names.
+dataset_groups:
+  # These drifted most in v6 and need the strongest protection.
+  hard_preserve:
+    - finewebedu
+    - pes2o-v3
+
+  # Good v6 results; maintain coverage but no extra pressure needed.
+  general_preserve:
+    - automathtext-v2-quasar-10b
+    - cosmopedia-wikihow-stories-quasar-10b
+    - openthoughts3-1.2m-quasar-10b
+    - ultradata-math-l3-quasar-10b
+    - nemotron-cc-math-v1-4plus-mind-quasar-10b
+
+  # Primary improvement targets for NewKing miner performance.
+  target_improve:
+    - dendrite-synth-run
+    - nemotron-specialized-v1.2-quasar-10b
+    - openmathreasoning-quasar-10b
+
+# ── Dataset sampling multipliers ─────────────────────────────────────────────
+# effective_count = round(base_count * multiplier)
+# Oversamples with replacement when effective_count > available sequences.
+# Omitted datasets default to ×1.0.
+#
+# v6 drift observed:
+#   finewebedu : Δ = -0.00021  (already raised to 30k in v6; mild extra boost)
+#   pes2o-v3   : Δ = -0.00024  (only 3k in v6; strongest boost needed)
+#
+#   finewebedu : 30,000 × 1.2 → 36,000 effective sequences
+#   pes2o-v3   :  3,000 × 2.0 →  6,000 effective sequences  [oversampled]
+dataset_sampling_multipliers:
+  finewebedu: 1.2
+  pes2o-v3: 2.0
+
+# ── Dataset loss multipliers ──────────────────────────────────────────────────
+# Applied per example: loss = (per_example_loss * weight).mean()
+# Omitted datasets default to ×1.0.
+#
+#   finewebedu : gentle extra gradient pressure  (×1.2)
+#   pes2o-v3   : stronger gradient pressure      (×1.5)
+dataset_loss_multipliers:
+  finewebedu: 1.2
+  pes2o-v3: 1.5
+
+# ── Per-dataset manifest URL overrides ───────────────────────────────────────
+# Overrides {hippius_base_url}/{name}/manifest.json for individual datasets.
+# Alternatively, pre-download the .npy into {dataset_cache_dir}/{name}/ and
+# the trainer detects it automatically without needing a manifest URL.
+# Source of truth: https://s3.hippius.com/teutonic-sn3/dataset/all-datasets.manifest.json
+dataset_manifest_urls:
+  dendrite-synth-run: "https://us-east-1.hippius.com/dendrite-teutonic/dataset/dendrite-synth-run/manifest.json"
+  cosmopedia-wikihow-stories-quasar-10b: "https://eu-central-1.hippius.com/teutonic-sn3/dataset/cosmopedia-wikihow-stories-quasar-10b/manifest.json"
+  openthoughts3-1.2m-quasar-10b: "https://eu-central-1.hippius.com/teutonic-sn3/dataset/openthoughts3-1.2m-quasar-10b/manifest.json"
+  finewebedu: "https://eu-central-1.hippius.com/teutonic-sn3/dataset/finewebedu/manifest.json"
+  automathtext-v2-quasar-10b: "https://eu-central-1.hippius.com/teutonic-sn3/dataset/automathtext-v2-quasar-10b/manifest.json"
+  nemotron-specialized-v1.2-quasar-10b: "https://eu-central-1.hippius.com/teutonic-sn3/dataset/nemotron-specialized-v1.2-quasar-10b/manifest.json"
+  openmathreasoning-quasar-10b: "https://eu-central-1.hippius.com/teutonic-sn3/dataset/openmathreasoning-quasar-10b/manifest.json"
+  ultradata-math-l3-quasar-10b: "https://us-east-1.hippius.com/teutonic-sn3/dataset/ultradata-math-quasar-10b/manifest.json"
+  pes2o-v3: "https://s3.hippius.com/teutonic-sn3/dataset/pes2o-v3/manifest.json"
+  nemotron-cc-math-v1-4plus-mind-quasar-10b: "https://eu-central-1.hippius.com/teutonic-sn3/dataset/nemotron-cc-math-v1-4plus-mind-quasar-10b/manifest.json"
+
+# ── Shard selection ───────────────────────────────────────────────────────────
+# default_shard_index: which shard to download when no per-dataset override.
+#   -1 = last shard  (newest data, default)
+#    0 = first shard (oldest data)
+# dataset_shard_indices: per-dataset overrides (same integer semantics).
+#
+# dendrite-synth-run has 3 new shards appended at the end → keep at -1.
+default_shard_index: -1
+dataset_shard_indices: {}  # e.g.  finewebedu: 0  to pin to shard[0]
+
+# ── Hippius dataset source ────────────────────────────────────────────────────
+hippius_base_url: "https://us-east-1.hippius.com/tokens-here/dataset"
+
+# ── Local shard cache root ────────────────────────────────────────────────────
+# Each dataset cached under {dataset_cache_dir}/{dataset_name}/
+dataset_cache_dir: "/workspace/teutonic/data"
