@@ -84,7 +84,15 @@ def main() -> None:
     base = Path(args.base_model).resolve()
     adapter = Path(args.adapter_dir).resolve()
     out = Path(args.output_dir).resolve()
-    tok_src = Path(args.tokenizer).resolve() if args.tokenizer else (
+    def _resolve_tok(s: str) -> "str | Path":
+        """Return a resolved local Path if s looks like a filesystem path, else the
+        raw Hub ID string so transformers can fetch it from the Hub."""
+        p = Path(s)
+        if p.exists() or s.startswith("/") or s.startswith("./") or s.startswith("../"):
+            return p.resolve()
+        return s  # Hub repo id, e.g. "silx-ai/Quasar-10B"
+
+    tok_src: "str | Path" = _resolve_tok(args.tokenizer) if args.tokenizer else (
         adapter if (adapter / "tokenizer.json").exists() or (adapter / "tokenizer_config.json").exists()
         else base
     )
@@ -121,7 +129,7 @@ def main() -> None:
     merged.save_pretrained(str(out), safe_serialization=True)
 
     tok = AutoTokenizer.from_pretrained(
-        str(tok_src),
+        tok_src if isinstance(tok_src, str) else str(tok_src),
         trust_remote_code=True,
         use_fast=True,
     )
