@@ -7,12 +7,12 @@ Validated stack (this instance):
 
 | Piece | Version / note |
 |-------|----------------|
-| GPU | NVIDIA H100 80GB |
+| GPU | NVIDIA A100 80GB (also validated on H100) |
 | Python | 3.11 (project `.venv`) |
 | torch | `2.5.1+cu121` |
 | transformers | `5.14.1` |
-| peft | `0.19.1` |
-| flash-linear-attention (`fla`) | `0.5.1` |
+| peft | `0.20.0` |
+| flash-linear-attention (`fla`) | `0.5.2` |
 | **triton** | **`3.3.0` only** (do not use ≥3.4) |
 | causal-conv1d | `1.6.2.post1` (build with `--no-build-isolation`) |
 | datasets | `5.x` (no dataset scripts) |
@@ -22,17 +22,17 @@ Validated stack (this instance):
 ## 0. Paths & prerequisites
 
 ```bash
-# Repo lives here on this box (symlink used by modeling code):
-#   /workspace/teutonic  ==  /root/teutonic
-ln -sfn /workspace/teutonic /root/teutonic
+# Repo lives here on this box (symlink used by modeling code defaults):
+#   /workspace/teu_lora  ==  /root/teutonic
+ln -sfn /workspace/teu_lora /root/teutonic
 
-cd /workspace/teutonic
-source .venv/bin/activate   # or: uv venv .venv && source .venv/bin/activate
+cd /workspace/teu_lora
+source .venv/bin/activate   # or: uv venv .venv --python 3.11 && source .venv/bin/activate
 ```
 
 You need:
 
-1. **Base weights** at `/root/teutonic/newking` (or set `TEUTONIC_MODEL_DIR`).
+1. **Base weights** at `/workspace/teu_lora/newking` (or set `TEUTONIC_MODEL_DIR`).
    - If shards are age-encrypted (`teutonic_encryption.json` present), decrypt
      first with `age` + `keys/validator_model_decryption.key` before training.
 2. **Disk** for HF cache + synth shard (~1.2 GB npy).
@@ -50,7 +50,7 @@ pm2 --version
 ### 1.1 PyTorch (CUDA wheel index)
 
 ```bash
-source /workspace/teutonic/.venv/bin/activate
+source /workspace/teu_lora/.venv/bin/activate
 uv pip install torch torchvision torchaudio \
   --index-url https://download.pytorch.org/whl/cu121
 ```
@@ -65,7 +65,7 @@ uv pip install \
   "peft>=0.10.0" \
   safetensors tokenizers huggingface_hub \
   bitsandbytes tensorboard \
-  numpy pandas tqdm sentencepiece protobuf einops
+  numpy pandas tqdm sentencepiece protobuf einops pyyaml
 ```
 
 ### 1.3 FLA + Triton (pin Triton)
@@ -92,7 +92,7 @@ uv pip install "triton==3.3.0"
 ### 1.5 Sanity imports
 
 ```bash
-export PYTHONPATH=/workspace/teutonic/newking
+export PYTHONPATH=/workspace/teu_lora/newking
 python - <<'PY'
 import torch, transformers, peft, fla, triton, causal_conv1d, configuration_qwen3_5
 assert tuple(int(x) for x in triton.__version__.split(".")[:2]) < (3, 4)
@@ -135,7 +135,7 @@ Fix B — pre-download the `.npy` shard manually and place it in the cache direc
 ```bash
 # The trainer auto-detects any *.npy already in the expected cache path.
 # No manifest URL is needed when the file is already present.
-CACHE=/workspace/teutonic/data/<dataset-name>
+CACHE=/workspace/teu_lora/data/<dataset-name>
 mkdir -p $CACHE
 # copy / download the .npy here, e.g. via hippius-hub or direct S3:
 hippius-hub download <namespace>/<dataset-name> shard_000000.npy --local-dir $CACHE
@@ -159,7 +159,7 @@ Modeling patch location (commit/keep in sync with HF dynamic-module cache):
 | `quasar-synth-v1` | 120,000 | Pre-tokenized packed `uint32` `.npy` @ 2048 |
 
 - Manifest: `https://us-east-1.hippius.com/tokens-here/dataset/quasar-synth-v1/manifest.json`
-- Cached shard: `/workspace/teutonic/data/quasar-synth-v1/shard_000000.npy` (~1.19 GB)
+- Cached shard: `/workspace/teu_lora/data/quasar-synth-v1/shard_000000.npy` (~1.19 GB)
 - Total: **130,000** sequences, 1 epoch, seq_len **2048**
 - Effective batch: `1 × 32 accum = 32` → ~**4,062** optimizer steps
 
@@ -173,7 +173,7 @@ TEUTONIC_LORA_BATCH=1
 TEUTONIC_LORA_GRAD_ACCUM=16
 TEUTONIC_LORA_SEQ_LEN=2048
 TEUTONIC_SYNTH_MANIFEST_URL=https://us-east-1.hippius.com/tokens-here/dataset/quasar-synth-v1/manifest.json
-TEUTONIC_MODEL_DIR=/root/teutonic/newking
+TEUTONIC_MODEL_DIR=/workspace/teu_lora/newking
 ```
 
 ---
@@ -186,7 +186,7 @@ Process name: `teutonic-train-lora` (one-shot, `autorestart: false`)
 
 ```bash
 . /opt/nvm/nvm.sh
-cd /workspace/teutonic
+cd /workspace/teu_lora
 
 # Fresh start
 pm2 delete teutonic-train-lora 2>/dev/null || true
@@ -219,9 +219,9 @@ pm2 start ecosystem.train.config.js
 Foreground (debug) alternative:
 
 ```bash
-cd /workspace/teutonic
+cd /workspace/teu_lora
 source .venv/bin/activate
-export PYTHONPATH=/workspace/teutonic/newking
+export PYTHONPATH=/workspace/teu_lora/newking
 export HF_HOME=/workspace/.hf_home
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 python train_lora.py
@@ -265,14 +265,14 @@ Base weights under `newking/` are snapshotted before/after; script prints
 ## 7. Quick reinstall one-liner (after venv exists)
 
 ```bash
-source /workspace/teutonic/.venv/bin/activate
+source /workspace/teu_lora/.venv/bin/activate
 uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 uv pip install "transformers>=4.47.0" "datasets>=2.18.0" "accelerate>=0.27.0" "peft>=0.10.0" \
   safetensors tokenizers huggingface_hub bitsandbytes tensorboard \
-  numpy pandas tqdm sentencepiece protobuf einops flash-linear-attention
+  numpy pandas tqdm sentencepiece protobuf einops pyyaml flash-linear-attention
 uv pip install causal-conv1d --no-build-isolation
 uv pip install "triton==3.3.0"
-ln -sfn /workspace/teutonic /root/teutonic
+ln -sfn /workspace/teu_lora /root/teutonic
 ```
 
-Then: `pm2 start /workspace/teutonic/ecosystem.train.config.js`
+Then: `pm2 start /workspace/teu_lora/ecosystem.train.config.js`

@@ -25,7 +25,7 @@ module.exports = {
       PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True",
       TOKENIZERS_PARALLELISM: "false",
       // Active run config — swap to a different config file to change experiments.
-      TEUTONIC_TRAIN_CONFIG: "/workspace/teu_lora/configs/v7_hard_preserve.yaml",
+      TEUTONIC_TRAIN_CONFIG: "/workspace/teu_lora/configs/v7_sampling.yaml",
       TEUTONIC_LORA_BATCH: "1",
       TEUTONIC_LORA_GRAD_ACCUM: "16",
       TEUTONIC_LORA_SEQ_LEN: "2048",

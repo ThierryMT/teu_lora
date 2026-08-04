@@ -57,6 +57,7 @@ scripts/experiments/services/
 runs/
 models/
 newking/
+data/
 tunnel.sh
 
 keys/validator_model_decryption.key

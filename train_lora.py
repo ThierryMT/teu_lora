@@ -49,7 +49,7 @@ from transformers import (
 from peft import LoraConfig, get_peft_model, TaskType
 from datasets import load_dataset, Dataset
 
-MODEL_DIR = os.environ.get("TEUTONIC_MODEL_DIR", "/root/teutonic/newking")
+MODEL_DIR = os.environ.get("TEUTONIC_MODEL_DIR", "/workspace/teu_lora/newking")
 TOKENIZER_ID = os.environ.get("TEUTONIC_TOKENIZER_ID", "silx-ai/Quasar-10B")
 
 # ── YAML config (optional) ────────────────────────────────────────────────────
@@ -80,19 +80,28 @@ MAX_STEPS      = _cv("max_steps",     "TEUTONIC_LORA_MAX_STEPS",    -1)   # -1 =
 
 # Sequence / batch parameters
 SEQ_LEN    = _cv("seq_len",    "TEUTONIC_LORA_SEQ_LEN",    2048)
-BATCH_SIZE = _cv("batch_size", "TEUTONIC_LORA_BATCH",       1)
-GRAD_ACCUM = _cv("grad_accum", "TEUTONIC_LORA_GRAD_ACCUM", 16)
+BATCH_SIZE = _cv("batch_size", "TEUTONIC_LORA_BATCH",       2)
+GRAD_ACCUM = _cv("grad_accum", "TEUTONIC_LORA_GRAD_ACCUM", 8)
 
 # ── Dataset config ────────────────────────────────────────────────────────────
-# Config-driven path: dataset_counts maps dataset name → number of sequences.
+# Config-driven path: dataset_counts maps dataset name → number of sequences
+# (or the string "all" = every sequence in the selected shard pool).
 # Legacy path (no YAML): three env vars as before.
-DATASET_COUNTS: dict[str, int]
+def _parse_dataset_count(raw):
+    if isinstance(raw, str) and raw.strip().lower() == "all":
+        return "all"
+    return int(raw)
+
+
+DATASET_COUNTS: dict[str, object]
 DATASET_GROUPS: dict[str, list[str]]
 HIPPIUS_BASE_URL: str
 DATASET_CACHE_DIR: Path
 
 if _cfg:
-    DATASET_COUNTS = {k: int(v) for k, v in _cfg.get("dataset_counts", {}).items()}
+    DATASET_COUNTS = {
+        k: _parse_dataset_count(v) for k, v in _cfg.get("dataset_counts", {}).items()
+    }
     DATASET_GROUPS = {
         grp: list(names)
         for grp, names in _cfg.get("dataset_groups", {}).items()
@@ -152,15 +161,81 @@ DATASET_MANIFEST_URLS: dict[str, str] = {
     for k, v in _cfg.get("dataset_manifest_urls", {}).items()
 }
 
-# Per-dataset shard index to download (name → int, default -1 = last shard).
-# -1  : always use the newest/last shard in the manifest  ← default
-#  0  : first shard (oldest)
-#  N  : Nth shard (0-based, negative indices wrap from the end)
-DATASET_SHARD_INDICES: dict[str, int] = {
-    k: int(v)
+# Per-dataset shard selection.
+# Spec forms (YAML):
+#   -1 / N          → single shard (negative wraps from the end; -1 = last)
+#   [0, 1, 2]       → those shard indices (pool sequences across them)
+#   all             → every shard in the manifest
+# Every selected shard is downloaded and contributes sequences to training
+# (stratified across the full pool — not a lazy subset of shards).
+def _parse_shard_spec(raw):
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        if raw.strip().lower() == "all":
+            return "all"
+        return int(raw)
+    if isinstance(raw, bool):
+        raise ValueError(f"invalid shard spec: {raw!r}")
+    if isinstance(raw, int):
+        return int(raw)
+    if isinstance(raw, list):
+        if len(raw) == 1 and isinstance(raw[0], str) and raw[0].strip().lower() == "all":
+            return "all"
+        return [int(x) for x in raw]
+    raise ValueError(f"invalid shard spec: {raw!r}")
+
+
+DATASET_SHARD_INDICES: dict[str, object] = {
+    k: _parse_shard_spec(v)
     for k, v in _cfg.get("dataset_shard_indices", {}).items()
 }
-_DEFAULT_SHARD_INDEX: int = int(_cfg.get("default_shard_index", -1))
+if "default_shard_indices" in _cfg:
+    _DEFAULT_SHARD_SPEC = _parse_shard_spec(_cfg.get("default_shard_indices"))
+elif "default_shard_index" in _cfg:
+    _DEFAULT_SHARD_SPEC = _parse_shard_spec(_cfg.get("default_shard_index"))
+else:
+    _DEFAULT_SHARD_SPEC = -1
+
+
+def resolve_shard_indices(spec, n_shards: int) -> list[int]:
+    """Normalize a shard spec to a sorted unique list of valid indices."""
+    if n_shards <= 0:
+        raise ValueError("manifest has no shards")
+    if spec == "all":
+        return list(range(n_shards))
+    if isinstance(spec, list):
+        raw_list = spec
+    else:
+        raw_list = [int(spec)]
+    out: list[int] = []
+    for s in raw_list:
+        i = int(s)
+        if i < 0:
+            i = n_shards + i
+        if i < 0 or i >= n_shards:
+            raise ValueError(
+                f"shard index {s} out of range for manifest with {n_shards} shards"
+            )
+        out.append(i)
+    # Preserve order, drop duplicates.
+    seen: set[int] = set()
+    uniq: list[int] = []
+    for i in out:
+        if i not in seen:
+            seen.add(i)
+            uniq.append(i)
+    return uniq
+
+
+def _shard_spec_label(spec) -> str:
+    if spec == "all":
+        return "all"
+    if isinstance(spec, list):
+        return ",".join(str(x) for x in spec)
+    if spec == -1:
+        return "last"
+    return str(spec)
 
 def patch_transformers_masking_compat() -> None:
     """Quasar modeling passes cache_position; some masking_utils builds reject it."""
@@ -292,8 +367,12 @@ print(f"  Max steps    : {MAX_STEPS if MAX_STEPS > 0 else '(full epoch)'}")
 print(f"  Batch/Accum  : {BATCH_SIZE} / {GRAD_ACCUM}  (effective {BATCH_SIZE * GRAD_ACCUM})")
 print(f"  Seq length   : {SEQ_LEN}")
 print(f"  Datasets     : {list(DATASET_COUNTS.keys())}")
-total_seqs = sum(DATASET_COUNTS.values())
-print(f"  Total seqs   : {total_seqs:,}")
+_count_nums = [v for v in DATASET_COUNTS.values() if isinstance(v, int)]
+_count_all = [k for k, v in DATASET_COUNTS.items() if v == "all"]
+if _count_all:
+    print(f"  Total seqs   : {sum(_count_nums):,}+  (plus ALL from: {', '.join(_count_all)})")
+else:
+    print(f"  Total seqs   : {sum(_count_nums):,}")
 if DATASET_GROUPS:
     for grp, members in DATASET_GROUPS.items():
         print(f"  Group [{grp}]: {members}")
@@ -379,30 +458,98 @@ class MmapPackedSynthDataset(TorchDataset):
         }
 
 
-def synth_shard_url(manifest_url: str, shard_key: str) -> str:
+def synth_shard_url_candidates(manifest_url: str, shard_key: str) -> list[str]:
+    """Build candidate download URLs for a shard.
+
+    Hippius manifests often store a bucket-relative `key` (e.g.
+    ``dataset/ultradata-math-quasar-10b/shards/….npy``) that does **not**
+    match the manifest folder name (e.g. ``…/ultradata-math-l3-…/``). Prefer
+    ``{bucket_root}/{key}``, then fall back to colocated ``{manifest_dir}/shards/{fname}``.
     """
-    Manifest may list an outdated shard_prefix (quasar-synth-run). Prefer shards
-    colocated next to the manifest (…/quasar-synth-v1/shards/<file>).
-    """
+    from urllib.parse import urlparse
+
     fname = shard_key.rstrip("/").rsplit("/", 1)[-1]
+    key = shard_key.lstrip("/")
     base = manifest_url.rsplit("/", 1)[0]
-    return f"{base}/shards/{fname}"
+    colocated = f"{base}/shards/{fname}"
+
+    cands: list[str] = []
+    p = urlparse(manifest_url)
+    parts = [x for x in p.path.split("/") if x]
+    if "dataset" in parts:
+        bucket_parts = parts[: parts.index("dataset")]
+        bucket_root = f"{p.scheme}://{p.netloc}"
+        if bucket_parts:
+            bucket_root = f"{bucket_root}/{'/'.join(bucket_parts)}"
+        if key and "/" in key:
+            cands.append(f"{bucket_root}/{key}")
+        cands.append(f"{bucket_root}/dataset/{base.rstrip('/').rsplit('/', 1)[-1]}/shards/{fname}")
+
+    cands.append(colocated)
+
+    # Dedupe, preserve order.
+    seen: set[str] = set()
+    out: list[str] = []
+    for u in cands:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+def synth_shard_url(manifest_url: str, shard_key: str) -> str:
+    """Best-guess single URL (first candidate). Prefer resolve_synth_shard_url()."""
+    return synth_shard_url_candidates(manifest_url, shard_key)[0]
+
+
+def resolve_synth_shard_url(manifest_url: str, shard_key: str) -> str:
+    """Return the first candidate URL that responds (HEAD), else the first candidate."""
+    cands = synth_shard_url_candidates(manifest_url, shard_key)
+    for url in cands:
+        try:
+            req = urllib.request.Request(url, method="HEAD")
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                if 200 <= getattr(resp, "status", 200) < 300:
+                    return url
+        except Exception:
+            continue
+    return cands[0]
+
+
+def fetch_dataset_manifest(manifest_url: str, cache_dir: Path) -> dict:
+    """Load manifest.json from cache_dir if present, else download and cache it."""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    local_mf = cache_dir / "manifest.json"
+    if local_mf.exists():
+        try:
+            return json.loads(local_mf.read_text())
+        except Exception:
+            pass
+    with urllib.request.urlopen(manifest_url, timeout=60) as resp:
+        manifest = json.loads(resp.read().decode("utf-8"))
+    try:
+        local_mf.write_text(json.dumps(manifest))
+    except Exception:
+        pass
+    return manifest
 
 
 def ensure_synth_shard(
     manifest_url: str,
     cache_dir: Path,
     shard_index: int = -1,
+    manifest: dict | None = None,
 ) -> tuple[Path, dict]:
     cache_dir.mkdir(parents=True, exist_ok=True)
-    with urllib.request.urlopen(manifest_url, timeout=60) as resp:
-        manifest = json.loads(resp.read().decode("utf-8"))
+    if manifest is None:
+        with urllib.request.urlopen(manifest_url, timeout=60) as resp:
+            manifest = json.loads(resp.read().decode("utf-8"))
     shards = manifest.get("shards") or []
     if not shards:
         raise RuntimeError(f"no shards in manifest: {manifest_url}")
     shard = shards[shard_index]
     key = shard["key"]
-    url = synth_shard_url(manifest_url, key)
+    url = resolve_synth_shard_url(manifest_url, key)
     expected = int(shard.get("size_bytes") or 0)
     dest = cache_dir / Path(key).name
     if dest.exists() and (expected <= 0 or dest.stat().st_size == expected):
@@ -421,6 +568,58 @@ def ensure_synth_shard(
     return dest, manifest
 
 
+def ensure_synth_shard_by_entry(
+    manifest_url: str,
+    cache_dir: Path,
+    shard: dict,
+    shard_index: int,
+    n_shards: int,
+) -> Path:
+    """Download one shard dict from a manifest if missing/incomplete."""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    key = shard["key"]
+    url = resolve_synth_shard_url(manifest_url, key)
+    expected = int(shard.get("size_bytes") or 0)
+    dest = cache_dir / Path(key).name
+    if dest.exists() and (expected <= 0 or dest.stat().st_size == expected):
+        print(
+            f"      shard [{shard_index}/{n_shards - 1}] cached: "
+            f"{dest.name} ({dest.stat().st_size:,} bytes)"
+        )
+        return dest
+    print(
+        f"      Downloading shard [{shard_index}/{n_shards - 1}] of {n_shards}:\n"
+        f"        {url}"
+    )
+    tmp = dest.with_suffix(dest.suffix + ".partial")
+    try:
+        urllib.request.urlretrieve(url, tmp)
+    except urllib.error.HTTPError as exc:
+        # Last-resort: try remaining candidates if HEAD missed a working one.
+        if exc.code == 404:
+            for alt in synth_shard_url_candidates(manifest_url, key):
+                if alt == url:
+                    continue
+                try:
+                    print(f"      retry 404 → {alt}")
+                    urllib.request.urlretrieve(alt, tmp)
+                    url = alt
+                    break
+                except Exception:
+                    continue
+            else:
+                raise
+        else:
+            raise
+    if expected > 0 and tmp.stat().st_size != expected:
+        raise RuntimeError(
+            f"synth shard size mismatch: got {tmp.stat().st_size}, expected {expected}"
+        )
+    tmp.replace(dest)
+    print(f"      shard ready: {dest.name} ({dest.stat().st_size:,} bytes)")
+    return dest
+
+
 def _load_or_download_shard(
     ds_name: str,
     manifest_url: str,
@@ -428,15 +627,7 @@ def _load_or_download_shard(
     seq_len: int,
     shard_index: int = -1,
 ) -> tuple[Path, dict]:
-    """Return (shard_path, manifest).
-
-    Resolution order:
-      1. Any *.npy already in cache_dir  — use it; read manifest.json if
-         present beside it, else synthesise a minimal one from seq_len.
-      2. Network download via manifest_url / ensure_synth_shard.
-         shard_index selects which shard to download (-1 = last/newest).
-         On HTTP 404, raises a RuntimeError with actionable instructions.
-    """
+    """Return (shard_path, manifest). Legacy single-shard helper."""
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Local-first: skip network if a shard is already on disk ──────────────
@@ -471,7 +662,181 @@ def _load_or_download_shard(
                 f"     The trainer will detect it automatically on next start.\n"
                 f"     (Use hippius-hub or direct S3 download to obtain the shard.)\n"
             ) from exc
-        raise# ─────────────────────────────────────────────
+        raise
+
+
+def _shard_nseqs(shard: dict, seq_len: int) -> int:
+    n_tokens = shard.get("n_tokens")
+    if n_tokens is not None:
+        return int(n_tokens) // seq_len
+    size_bytes = int(shard.get("size_bytes") or 0)
+    # uint32 packed tokens
+    if size_bytes > 0:
+        return (size_bytes // 4) // seq_len
+    return 0
+
+
+def _allocate_counts_across_shards(
+    nseqs_per: list[int],
+    effective_count: int,
+    rng: np.random.Generator,
+) -> list[int]:
+    """Split `effective_count` across shards so every non-empty shard is used.
+
+    Proportional to shard size. When effective_count >= n_nonempty_shards,
+    each nonempty shard gets ≥1 sequence.
+    """
+    n = len(nseqs_per)
+    alloc = [0] * n
+    nonempty = [i for i, nseq in enumerate(nseqs_per) if nseq > 0]
+    if not nonempty or effective_count <= 0:
+        return alloc
+
+    total = float(sum(nseqs_per[i] for i in nonempty))
+    fracs = {i: effective_count * (nseqs_per[i] / total) for i in nonempty}
+
+    # Proportional floor.
+    for i in nonempty:
+        alloc[i] = int(fracs[i])
+
+    # Ensure every shard is represented when the budget allows.
+    if effective_count >= len(nonempty):
+        for i in nonempty:
+            if alloc[i] == 0:
+                alloc[i] = 1
+
+    # Trim overflow (from the ≥1 guarantee) off the largest buckets.
+    while sum(alloc) > effective_count:
+        donors = [i for i in nonempty if alloc[i] > 1]
+        if not donors:
+            break
+        donors.sort(key=lambda i: alloc[i], reverse=True)
+        alloc[donors[0]] -= 1
+
+    # Give leftover counts to shards with largest fractional remainders.
+    remain = effective_count - sum(alloc)
+    if remain > 0:
+        order = sorted(
+            nonempty,
+            key=lambda i: (fracs[i] - int(fracs[i]), nseqs_per[i]),
+            reverse=True,
+        )
+        for k in range(remain):
+            alloc[order[k % len(order)]] += 1
+
+    return alloc
+
+
+def load_dataset_shards_sampled(
+    ds_name: str,
+    manifest_url: str,
+    cache_dir: Path,
+    seq_len: int,
+    shard_spec,
+    effective_count: int,
+    rng: np.random.Generator,
+    dataset_id: int,
+) -> tuple[TorchDataset, dict, int, list[int]]:
+    """Build a training set from the selected shard pool.
+
+    Downloads **every** selected shard. If `effective_count < 0`, uses every
+    sequence in those shards; otherwise samples `effective_count` sequences
+    stratified across shards so each shard is used in training.
+    Returns (dataset, manifest, n_seqs_avail, selected_shard_indices).
+    """
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        manifest = fetch_dataset_manifest(manifest_url, cache_dir)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            raise RuntimeError(
+                f"\n\n  ✗  [{ds_name}] Manifest not found — HTTP 404\n"
+                f"     URL tried : {manifest_url}\n\n"
+                f"  Fix options (choose one):\n\n"
+                f"  A) Override the manifest URL in your config:\n"
+                f"       dataset_manifest_urls:\n"
+                f"         {ds_name}: <correct_hippius_manifest_url>\n\n"
+                f"  B) Pre-download the .npy shard and place it here:\n"
+                f"       {cache_dir}/\n"
+                f"     The trainer will detect it automatically on next start.\n"
+            ) from exc
+        raise
+
+    shards = manifest.get("shards") or []
+    if not shards:
+        # Local-only fallback: any *.npy already cached.
+        npy_files = sorted(cache_dir.glob("*.npy"))
+        if not npy_files:
+            raise RuntimeError(f"[{ds_name}] no shards in manifest and no local .npy")
+        shards = [
+            {
+                "key": p.name,
+                "size_bytes": p.stat().st_size,
+                "n_tokens": int(np.load(p, mmap_mode="r").shape[0]),
+            }
+            for p in npy_files
+        ]
+        manifest = {"seq_len": seq_len, "shards": shards}
+
+    selected = resolve_shard_indices(shard_spec, len(shards))
+    nseqs_per = [_shard_nseqs(shards[i], seq_len) for i in selected]
+    n_seqs_avail = int(sum(nseqs_per))
+    if n_seqs_avail <= 0:
+        raise RuntimeError(
+            f"{ds_name}: selected shards have no complete sequences at seq_len={seq_len}"
+        )
+
+    # Download every selected shard up front — all of them are used for training.
+    print(
+        f"      [{ds_name}] downloading/using {len(selected)} shard(s) "
+        f"(pool avail={n_seqs_avail:,} seqs)..."
+    )
+    shard_paths: list[Path] = []
+    real_nseqs: list[int] = []
+    for shard_i in selected:
+        path = ensure_synth_shard_by_entry(
+            manifest_url, cache_dir, shards[shard_i], shard_i, len(shards)
+        )
+        mmap = np.load(path, mmap_mode="r")
+        n_local = int(mmap.shape[0]) // seq_len
+        if n_local <= 0:
+            raise RuntimeError(
+                f"{ds_name}: shard[{shard_i}] {path.name} has no sequences at seq_len={seq_len}"
+            )
+        shard_paths.append(path)
+        real_nseqs.append(n_local)
+
+    n_seqs_avail = int(sum(real_nseqs))
+
+    # effective_count < 0  → use every sequence in every selected shard.
+    use_all_seqs = effective_count < 0
+    if use_all_seqs:
+        per_shard_counts = list(real_nseqs)
+        effective_count = n_seqs_avail
+    else:
+        per_shard_counts = _allocate_counts_across_shards(real_nseqs, effective_count, rng)
+
+    piece_datasets: list[TorchDataset] = []
+    for spos, shard_i in enumerate(selected):
+        take = per_shard_counts[spos]
+        if take <= 0:
+            continue
+        n_local = real_nseqs[spos]
+        if use_all_seqs or take == n_local:
+            idx_arr = np.arange(n_local, dtype=np.int64)
+        else:
+            replace = take > n_local
+            idx_arr = rng.choice(n_local, size=take, replace=replace).astype(np.int64)
+        piece_datasets.append(
+            MmapPackedSynthDataset(shard_paths[spos], idx_arr, seq_len, dataset_id=dataset_id)
+        )
+
+    if not piece_datasets:
+        raise RuntimeError(f"{ds_name}: sampling produced empty shard set")
+    dataset: TorchDataset = (
+        piece_datasets[0] if len(piece_datasets) == 1 else ConcatDataset(piece_datasets)
+    )
+    return dataset, manifest, n_seqs_avail, selected# ─────────────────────────────────────────────
 # 1. TOKENIZER
 # ─────────────────────────────────────────────
 print(f"\n[1/8] Loading tokenizer from {TOKENIZER_ID} ...")
@@ -589,42 +954,64 @@ if _cfg:
             ds_name, f"{HIPPIUS_BASE_URL}/{ds_name}/manifest.json"
         )
         cache_dir = DATASET_CACHE_DIR / ds_name
-        print(f"      [{ds_name}] base={ds_count:,}  manifest: {manifest_url}")
-        shard_path, shard_manifest = _load_or_download_shard(
-            ds_name, manifest_url, cache_dir, SEQ_LEN,
-            shard_index=DATASET_SHARD_INDICES.get(ds_name, _DEFAULT_SHARD_INDEX),
+        shard_spec = DATASET_SHARD_INDICES.get(ds_name, _DEFAULT_SHARD_SPEC)
+        count_label = "all" if ds_count == "all" else f"{ds_count:,}"
+        print(
+            f"      [{ds_name}] base={count_label}  shards={_shard_spec_label(shard_spec)}"
+            f"  manifest: {manifest_url}"
         )
+
+        # Apply sampling multiplier (ignored when count is "all").
+        multiplier = DATASET_SAMPLING_MULTIPLIERS.get(ds_name, 1.0)
+        if ds_count == "all":
+            effective_count = -1  # sentinel: use every sequence in the shard pool
+        else:
+            effective_count = max(1, round(int(ds_count) * multiplier))
+
+        ds_piece, shard_manifest, n_seqs_avail, selected_idxs = load_dataset_shards_sampled(
+            ds_name=ds_name,
+            manifest_url=manifest_url,
+            cache_dir=cache_dir,
+            seq_len=SEQ_LEN,
+            shard_spec=shard_spec,
+            effective_count=effective_count,
+            rng=np.random.default_rng(42 + ds_idx),
+            dataset_id=ds_idx,
+        )
+        # After load, "all" resolves to the real available count.
+        if ds_count == "all":
+            effective_count = n_seqs_avail
+            multiplier = 1.0
         manifest_seq_len = int(shard_manifest.get("seq_len") or SEQ_LEN)
         if manifest_seq_len != SEQ_LEN:
             raise RuntimeError(
                 f"{ds_name}: manifest seq_len={manifest_seq_len} != SEQ_LEN={SEQ_LEN}"
             )
-        ds_mmap = np.load(shard_path, mmap_mode="r")
-        n_seqs_avail = int(ds_mmap.shape[0]) // SEQ_LEN
-        if n_seqs_avail == 0:
-            raise RuntimeError(
-                f"{ds_name}: shard has no complete sequences at seq_len={SEQ_LEN}"
-            )
 
-        # Apply sampling multiplier.
-        multiplier = DATASET_SAMPLING_MULTIPLIERS.get(ds_name, 1.0)
-        effective_count = max(1, round(ds_count * multiplier))
-        # Oversample with replacement when effective_count exceeds available sequences.
         replace = effective_count > n_seqs_avail
-        if not replace and n_seqs_avail < ds_count:
-            raise RuntimeError(
-                f"{ds_name}: only {n_seqs_avail:,} seqs available, need {ds_count:,}"
-            )
-
-        indices = np.random.default_rng(42).choice(n_seqs_avail, size=effective_count, replace=replace)
-        per_ds_datasets.append(MmapPackedSynthDataset(shard_path, indices, SEQ_LEN, dataset_id=ds_idx))
+        per_ds_datasets.append(ds_piece)
         _sampling_plan.append((ds_name, ds_count, multiplier, effective_count))
 
-        tag = f" (×{multiplier} → {effective_count:,})" if multiplier != 1.0 else ""
+        if ds_count == "all":
+            tag = " (ALL sequences)"
+        elif multiplier != 1.0:
+            tag = f" (×{multiplier} → {effective_count:,})"
+        else:
+            tag = ""
         resample_tag = " [oversample]" if replace else ""
-        si = DATASET_SHARD_INDICES.get(ds_name, _DEFAULT_SHARD_INDEX)
-        si_tag = f"  shard={'last' if si == -1 else si}"
-        print(f"      {ds_name}: {ds_count:,}{tag}  avail={n_seqs_avail:,}{resample_tag}{si_tag} ✅")
+        used_shards = (
+            len(ds_piece.datasets)  # type: ignore[attr-defined]
+            if isinstance(ds_piece, ConcatDataset)
+            else 1
+        )
+        if shard_spec == "all":
+            si_tag = f"  shards=all({len(selected_idxs)})"
+        else:
+            si_tag = f"  shards=[{','.join(str(i) for i in selected_idxs)}]"
+        print(
+            f"      {ds_name}: {count_label}{tag}  avail={n_seqs_avail:,}"
+            f"{resample_tag}{si_tag}  used_shards={used_shards} ✅"
+        )
 
     # ── Effective sampling plan summary ──────────────────────────────────────
     _eff_total = sum(e for _, _, _, e in _sampling_plan)
@@ -633,9 +1020,10 @@ if _cfg:
     print(f"      {'Dataset':<{col}}  {'base':>8}  {'×mult':>6}  {'effective':>10}  {'%':>6}")
     print(f"      {'─' * (col + 42)}")
     for ds_name, base, mult, eff in _sampling_plan:
-        pct = 100.0 * eff / _eff_total
-        mult_str = f"×{mult:.2f}"
-        print(f"      {ds_name:<{col}}  {base:>8,}  {mult_str:>6}  {eff:>10,}  {pct:>5.1f}%")
+        pct = 100.0 * eff / _eff_total if _eff_total else 0.0
+        mult_str = "all" if base == "all" else f"×{mult:.2f}"
+        base_str = "all" if base == "all" else f"{base:,}"
+        print(f"      {ds_name:<{col}}  {base_str:>8}  {mult_str:>6}  {eff:>10,}  {pct:>5.1f}%")
     print(f"      {'─' * (col + 42)}")
     print(f"      {'TOTAL':<{col}}  {'':>8}  {'':>6}  {_eff_total:>10,}  {'100.0%':>6}")
     print(f"      {'─' * (col + 42)}\n")

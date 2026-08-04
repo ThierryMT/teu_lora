@@ -1,45 +1,47 @@
-experiment_name: newking_v7
+experiment_name: newking_v7_openthoughts
 
-# ── LoRA hyperparameters (unchanged from v6) ─────────────────────────────────
+# Goal:
+#   - KEEP scores / knowledge on every non-target dataset (preserve)
+#   - IMPROVE openthoughts3-1.2m-quasar-10b (sole target)
+
+# ── LoRA hyperparameters (conservative — avoid wiping preserve sets) ──────────
 lora_r: 8
 learning_rate: 5.0e-6
 max_grad_norm: 0.02
-max_steps: 2500
+max_steps: 3500
 
-# ── Dataset sample counts (unchanged from v6) ────────────────────────────────
+# ── Dataset sample counts ─────────────────────────────────────────────────────
+# "all" = every sequence in the selected shard pool (no subsampling).
 dataset_counts:
-  dendrite-synth-run: 22000
+  # sole improve target — use the entire OpenThoughts corpus
+  openthoughts3-1.2m-quasar-10b: all
+
+  # hard preserve (historically drifted in v6)
+  finewebedu: 40000
+  pes2o-v3: 6000
+
+  # general preserve — maintain original knowledge, do not chase gains
+  dendrite-synth-run: 16000
   cosmopedia-wikihow-stories-quasar-10b: 13000
-  openthoughts3-1.2m-quasar-10b: 10000
-  finewebedu: 30000
-  automathtext-v2-quasar-10b: 14000
-  nemotron-specialized-v1.2-quasar-10b: 8000
+  automathtext-v2-quasar-10b: 30000
+  nemotron-specialized-v1.1-quasar-10b: 6000
+  nemotron-specialized-v1.2-quasar-10b: 6000
   openmathreasoning-quasar-10b: 6000
   ultradata-math-l3-quasar-10b: 5000
-  pes2o-v3: 3000
   nemotron-cc-math-v1-4plus-mind-quasar-10b: 3000
 
 # ── Dataset sampling multipliers ─────────────────────────────────────────────
-# v6 showed negative drift on hard-preserve datasets:
-#   finewebedu: Δ = -0.00021
-#   pes2o-v3:   Δ = -0.00024
-#
-# Increase effective sampling pressure on both.
-#   finewebedu : 30000 × 1.2 → 36,000 effective sequences
-#   pes2o-v3   :  3000 × 2.0 →  6,000 effective sequences (oversampled with replacement)
-#
-# All other datasets keep multiplier = 1.0 (default, no entry needed).
+# effective_count = round(base_count * multiplier)  (ignored when count is "all")
 dataset_sampling_multipliers:
-  finewebedu: 1.2
-  pes2o-v3: 2.0
+  finewebedu: 1.2                      # 40k × 1.2 → 48,000 effective
+  pes2o-v3: 2.0                        #  6k × 2.0 → 12,000 effective
 
 # ── Dataset loss multipliers ──────────────────────────────────────────────────
-# Amplify the gradient signal from hard-preserve datasets that drifted in v6.
 # Applied per example: loss = (per_example_loss * weight).mean()
-# All other datasets default to ×1.0.
+# OpenThoughts needs no loss boost — it already contributes every sequence.
 dataset_loss_multipliers:
-  finewebedu: 1.2
-  pes2o-v3: 1.5
+  finewebedu: 1.2                      # protect web-edu score
+  pes2o-v3: 1.5                        # protect science score
 
 # ── Dataset groups ────────────────────────────────────────────────────────────
 dataset_groups:
@@ -48,19 +50,50 @@ dataset_groups:
     - pes2o-v3
 
   general_preserve:
-    - automathtext-v2-quasar-10b
+    - dendrite-synth-run
     - cosmopedia-wikihow-stories-quasar-10b
-    - openthoughts3-1.2m-quasar-10b
+    - automathtext-v2-quasar-10b
+    - nemotron-specialized-v1.1-quasar-10b
+    - nemotron-specialized-v1.2-quasar-10b
+    - openmathreasoning-quasar-10b
     - ultradata-math-l3-quasar-10b
     - nemotron-cc-math-v1-4plus-mind-quasar-10b
 
   target_improve:
-    - dendrite-synth-run
-    - nemotron-specialized-v1.2-quasar-10b
-    - openmathreasoning-quasar-10b
+    - openthoughts3-1.2m-quasar-10b
+
+# ── Per-dataset manifest URL overrides ───────────────────────────────────────
+# Source of truth: https://s3.hippius.com/teutonic-sn3/dataset/all-datasets.manifest.json
+dataset_manifest_urls:
+  dendrite-synth-run: "https://us-east-1.hippius.com/dendrite-teutonic/dataset/dendrite-synth-run/manifest.json"
+  cosmopedia-wikihow-stories-quasar-10b: "https://eu-central-1.hippius.com/teutonic-sn3/dataset/cosmopedia-wikihow-stories-quasar-10b/manifest.json"
+  openthoughts3-1.2m-quasar-10b: "https://eu-central-1.hippius.com/teutonic-sn3/dataset/openthoughts3-1.2m-quasar-10b/manifest.json"
+  nemotron-specialized-v1.1-quasar-10b: "https://eu-central-1.hippius.com/teutonic-sn3/dataset/nemotron-specialized-v1.1-quasar-10b/manifest.json"
+  nemotron-specialized-v1.2-quasar-10b: "https://eu-central-1.hippius.com/teutonic-sn3/dataset/nemotron-specialized-v1.2-quasar-10b/manifest.json"
+  finewebedu: "https://eu-central-1.hippius.com/teutonic-sn3/dataset/finewebedu/manifest.json"
+  automathtext-v2-quasar-10b: "https://eu-central-1.hippius.com/teutonic-sn3/dataset/automathtext-v2-quasar-10b/manifest.json"
+  openmathreasoning-quasar-10b: "https://eu-central-1.hippius.com/teutonic-sn3/dataset/openmathreasoning-quasar-10b/manifest.json"
+  ultradata-math-l3-quasar-10b: "https://us-east-1.hippius.com/teutonic-sn3/dataset/ultradata-math-l3-quasar-10b/manifest.json"
+  pes2o-v3: "https://s3.hippius.com/teutonic-sn3/dataset/pes2o-v3/manifest.json"
+  nemotron-cc-math-v1-4plus-mind-quasar-10b: "https://eu-central-1.hippius.com/teutonic-sn3/dataset/nemotron-cc-math-v1-4plus-mind-quasar-10b/manifest.json"
+
+# ── Shard selection ───────────────────────────────────────────────────────────
+# Every listed shard is downloaded and used in training (stratified sample of
+# dataset_counts across those shards — no lazy shard skipping).
+#
+# default: first three shards for every dataset without an override.
+default_shard_indices: [0, 1, 2]
+
+# Full shard coverage for target + key preserve corpora:
+# (nemotron-specialized-v1.2 stays on first-3 — full set is ~174GB)
+dataset_shard_indices:
+  openthoughts3-1.2m-quasar-10b: all
+  dendrite-synth-run: all
+  cosmopedia-wikihow-stories-quasar-10b: all
+  nemotron-specialized-v1.1-quasar-10b: all
 
 # ── Hippius dataset source ────────────────────────────────────────────────────
 hippius_base_url: "https://us-east-1.hippius.com/tokens-here/dataset"
 
 # ── Local shard cache root ────────────────────────────────────────────────────
-dataset_cache_dir: "/workspace/teutonic/data"
+dataset_cache_dir: "/workspace/teu_lora/data"
